@@ -156,7 +156,6 @@ function lpc_encode_decode(xs, fs; lpcOrder=30, blockSizeMs=15, unvoicedZCR=0.12
         p = pitch_period_samples(center_clip(block))
         freq_hz = fs / p
         ft = (z > unvoicedZCR || freq_hz > unvoicedHz) ? UnvoicedFrame : VoicedFrame
-        println("$ft $z $freq_hz")
         if ft == VoicedFrame
             excitation = impulse_train(n; period=(p*4))
         else
