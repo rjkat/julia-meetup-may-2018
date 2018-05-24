@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Julia for Rapid Prototyping of Realtime Audio Processing</title>
+    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8"/>
+    <style type="text/css">
+      @import url(https://fonts.googleapis.com/css?family=Yanone+Kaffeesatz);
+      @import url(https://fonts.googleapis.com/css?family=Droid+Serif:400,700,400italic);
+      @import url(https://fonts.googleapis.com/css?family=Ubuntu+Mono:400,700,400italic);
+
+      body { font-family: 'Droid Serif'; }
+      h1, h2, h3 {
+        font-family: 'Yanone Kaffeesatz';
+        font-weight: normal;
+      }
+      .remark-code, .remark-inline-code { font-family: 'Ubuntu Mono'; }
+    </style>
+  </head>
+  <body>
+    <textarea id="source">
+
+class: center, middle
+
+# Julia for Rapid Prototyping <br/> of Realtime Audio Processing
+## Rowan Katekar, 24 May 2018
+### [`github.com/rkat`](http://github.com/rkat)
+### [`rkat@ieee.org`](mailto:rkat@ieee.org)
+
+---
+
+# Agenda
+
+Building a vocoder in Julia
+  1. What's a vocoder?
+    - Source-filter model
+    - Linear prediction
+  2. Working with audio in Julia
+    - Analysis
+    - Synthesis
+  3. Moving to realtime
+    - Profiling
+    - Memory allocation
+    - `PortAudio`
+    - Calling C functions
+
+Follow along at [`github.com/rkat/julia-meetup-may-2018`](http://github.com/rkat/julia-meetup-may-2018)
+
+---
+
+class: center, middle
+# What's a vocoder?
+
+---
+
+# Source-filter model
+
+.center[<img src="http://www.uni-bielefeld.de/lili/personen/vgramley/teaching/HTHS/source-filter.jpg" alt="Source-filter model" style="width: 37%;"/>]
+
+image from [Bielefeld University's Acoustic Phonetics course](http://www.uni-bielefeld.de/lili/personen/vgramley/teaching/HTHS/acoustic_2010.html)
+
+---
+
+# Vocoder
+
+A vocoder (short for voice encoder) uses the source-filter model to analyse a speech signal, and then resynthesise it
+
+.center[<img src="https://upload.wikimedia.org/wikipedia/commons/b/b6/Homer_Dudley_%28October_1940%29._%22The_Carrier_Nature_of_Speech%22._Bell_System_Technical_Journal%2C_XIX%284%29%3B495-515._--_Fig.7_Schematic_circuit_of_the_vocoder_%28derived_from_Fig.8%29.jpg" alt="Source-filter model" style="width: 75%;"/>]
+
+image from <a href="https://commons.wikimedia.org/wiki/File:Homer_Dudley_(October_1940)._%22The_Carrier_Nature_of_Speech%22._Bell_System_Technical_Journal,_XIX(4);495-515._--_Fig.8_Schematic_circuit_of_the_voder.jpg">Bell System Technical Journal, October 1940</a>
+
+---
+
+# Source
+
+We're going to simulate voiced and unvoiced sounds as different kinds of sources: 
+  - voiced sounds as a perfectly periodic signal ("buzz")
+  - unvoiced sounds as white noise ("hiss")
+
+.center[<img src="https://upload.wikimedia.org/wikipedia/commons/b/b6/Homer_Dudley_%28October_1940%29._%22The_Carrier_Nature_of_Speech%22._Bell_System_Technical_Journal%2C_XIX%284%29%3B495-515._--_Fig.7_Schematic_circuit_of_the_vocoder_%28derived_from_Fig.8%29.jpg" alt="Source-filter model" style="width: 75%;"/>]
+
+---
+
+# Filter
+
+- Use linear prediction to come up with a filter estimate
+- Run the source through the estimated filter
+
+.center[<img src="https://upload.wikimedia.org/wikipedia/commons/b/b6/Homer_Dudley_%28October_1940%29._%22The_Carrier_Nature_of_Speech%22._Bell_System_Technical_Journal%2C_XIX%284%29%3B495-515._--_Fig.7_Schematic_circuit_of_the_vocoder_%28derived_from_Fig.8%29.jpg" alt="Source-filter model" style="width: 75%;"/>]
+
+---
+
+# Linear prediction
+
+Ideal all-pole filter
+
+$$y[n] = \sum _{i = 1} ^N a_i[i] y[n - i]$$
+
+If `\(y\)` is speech and we already have `\(a\)`, we could
+try to predict the next sample from the last `\(N\)` samples:
+
+$$\hat{y}(n) = \sum _{i = 1} ^N a_i y[n - i]$$
+
+Our error would be
+
+$$e[n] = y[n] - \hat{y}[n]$$
+
+---
+
+# Linear prediction
+
+How do we get `\(a\)`?
+
+---
+
+# Linear prediction
+
+How do we get `\(a\)`?
+  - Minimise squared error
+
+\begin{align}
+E &= \sum _n e^2[n] \\\\
+  &= \sum _n (y[n] - \hat{y}[n])^2
+\end{align}
+  - Pick some number of coefficients `\(N\)`
+  - Set `\( \frac{\partial E}{\partial a_i} = 0 \)` for `\(1 \le i \le N\)`
+\begin{align}
+\implies \frac{\partial E}{\partial a_i} \left( \sum _n (y[n] - \hat{y}[n])^2 \right) = 0
+\end{align}
+  - Leads to `\(N\)` equations in `\(N\)` unknowns which we can then solve
+  - More info [here](http://www.emptyloop.com/technotes/a%20tutorial%20on%20linear%20prediction%20and%20levinson-durbin.pdf)
+
+---
+
+# Levinson-Durbin
+
+An efficient way of solving the `\(N\)` equations in `\(N\)` unknowns
+
+```julia
+function levinson{T<:Real}(r::Vector{T}, m::Int)
+    A = zeros(m, m)
+    err = zeros(1, m)
+
+    # for k = 1
+    A[1, 1] = - (r[2] / r[1])
+    err[1] = r[1] * (1 - A[1, 1] ^ 2)
+
+    # for k = 2,3,4,..m
+    for k = 2:m
+        λ = -(sum(A[k-1, 1:k-1] .* r[k:-1:2]) + r[k+1])/err[k-1]
+        A[k, k] = λ
+        A[k, 1:k-1] .= A[k-1, 1:k-1] + λ * A[k-1, k-1:-1:1]
+        err[k] = err[k-1] * (1 - λ^2)
+    end
+    A[m, :], err[m]
+end
+
+function lpc(xs, m)
+    r = xcorr(xs, xs)[length(xs):end]
+    A, err = levinson(r, m)
+    return A, err
+end
+```
+
+---
+
+class: center, middle
+# Working with audio in Julia
+
+---
+
+# Analysis: PlotlyJS.jl
+
+- [`PlotlyJS.jl`](http://spencerlyon.com/PlotlyJS.jl/) is a port of [`plotly.js`](https://plot.ly/javascript/) to Julia
+- Well-documented, customisable
+
+```julia
+using PlotlyJS
+plot(scatter(x=1:10, y=2:2:20), Layout(
+    title="An amazing graph",
+    yaxis_title="Your interest",
+    xaxis_title="Time"
+))
+```
+<div align="center"><iframe src="amazing_graph.html" width="600" height="600" style="border:none; display:block; transform: scale(0.7); margin-top: -110px"></iframe></div>
+
+---
+
+# Analysis: Plotting a spectrum
+
+```julia
+using DSP
+using WAV
+using PlotlyJS
+
+function fft_trace(x, fs; name="spectrum")
+    ys = abs.(fftshift(fft(x)))
+    nbins = div(length(ys), 2)
+    xs = round.(Int, fs / 2 * (0:nbins-1) ./ (nbins))
+    spec = 20.*log10.(ys[nbins+1:end])
+    scatter(x=xs, y=spec, name=name)
+end
+
+pcm, fs = wavread("in.wav")
+x = pcm[:, 1]
+plot(fft_trace(x, fs), Layout(
+  title=title,
+  yaxis_title="magnitude (dB)",
+  xaxis_type="log",
+  xaxis_title="frequency (Hz)"
+))
+```
+---
+
+# Analysis: Linear prediction
+
+Predicting voiced and unvoiced speech with linear prediction order `\(N\)`
+
+<div align="center"><iframe src="lp.html" width="900" height="500" style="border:none; display:block;  transform: scale(0.9)"></iframe></div>
+
+---
+
+# Analysis: Voiced/unvoiced detection
+
+Count the number of zeros
+
+```julia
+function zero_crossing_rate(x)
+    sum(abs.(diff(0.5 .* sign.(x)))) / length(x)
+end
+```
+
+---
+
+# Analysis: Marking up .wav files in Julia
+
+```julia
+function dump_voicing_labels(x, fs, block_size_samples, labels, outfile)
+    markers = Dict{UInt32, WAVMarker}()
+    j = 0
+    last_label = labels[1]
+    i = 1
+    for l in labels[2:end]
+        if l != last_label
+            markers[length(markers)] = WAVMarker(
+                last_label == VoicedFrame ? "voiced" : "unvoiced",
+                floor(Int, j * block_size_samples),
+                floor(Int, (i - j) * block_size_samples))
+            j = i
+            last_label = l
+        end
+        i += 1
+    end
+
+    l = labels[end]
+    markers[length(markers)] = WAVMarker(
+        last_label == VoicedFrame ? "voiced" : "unvoiced",
+        floor(Int, j * block_size_samples),
+        floor(Int, (length(labels) - j) * block_size_samples))
+
+    out_chunks = wav_cue_write(markers)
+    wavwrite(x, outfile, Fs=fs, chunks=out_chunks)
+end
+```
+
+---
+
+# Analysis: Pitch estimation
+
+Cross correlation
+
+```julia
+function pitch_period_samples(xs; min_period_samples=50)
+    m = findmax(xcorr(xs, xs)[length(xs)+min_period_samples:end])[2]
+    m + min_period_samples
+end
+```
+
+---
+
+# Synthesis: Buzz/hiss
+
+```julia
+@enum FrameType VoicedFrame UnvoicedFrame
+
+function impulse_train(n; period=n)
+    nrepeats = div(n + period - 1, period)
+    repeat([1.; [0. for _ = 1:period-1]], outer=nrepeats)[1:n]
+end
+
+z = zero_crossing_rate(block)
+p = pitch_period_samples(block)
+
+ft = (z > unvoicedZCR || freq_hz > unvoicedHz) ? UnvoicedFrame : VoicedFrame
+
+if ft == VoicedFrame
+    excitation = impulse_train(n; period=p)
+else
+    excitation = (rand(n) - 0.5) * 0.1
+end
+```
+
+---
+
+# Synthesis: Filtering using the DSP module
+
+```julia
+using DSP
+A, erra = lpc(block, lpcOrder)
+G = sqrt(erra)
+
+f = PolynomialRatio([G], [1; A])
+predicted = hamming(n) .* filt(f, excitation)
+```
+
+---
+
+class: center, middle
+# Moving to realtime
+
+---
+
+# Profiling
+
+- `@time` macro can give you absolute timing
+  ```julia
+  julia> @time level("in.wav")
+  0.083182 seconds (720.13 k allocations: 19.291 MiB)
+  ```
+- `@profile` macro can give you profiling reports (more info [here](https://docs.julialang.org/en/latest/manual/profile/)).
+  ```julia
+  Profile.init()
+  @profile level("in.wav")
+  open("profile.txt", "w") do f Profile.print(f, Profile.retrieve()...) end
+  ```
+  ```
+  64 ...v0.6/WAV/src/WAV.jl:616; #wavread#13(::Type{T} where T...
+    64 ...0.6/WAV/src/WAV.jl:504; read_data(::IOStream, ::UInt...
+     64 ...0.6/WAV/src/WAV.jl:264; read_ieee_float_samples(::I...
+      63 ....6/WAV/src/WAV.jl:255; read_ieee_float_samples(::I...
+  ```
+
+- The first time anything is called, it gets JIT compiled. So call it once before you want to measure it.
+
+---
+
+# Memory allocation
+
+```bash
+julia --track-allocation=user your_file.jl
+```
+
+```julia
+using Coverage
+xs = analyze_malloc(".")
+lines = ["$(x.bytes) $(splitext(x.filename)[1]):$(x.linenumber)" for x in xs]
+open("mem.txt", "w") do f println(f, join(lines, "\n")) end
+```
+
+```
+1024 your_file.jl:42
+```
+
+---
+
+# PortAudio.jl
+
+[PortAudio.jl](https://github.com/JuliaAudio/PortAudio.jl) is a wrapper for [libportaudio](http://www.portaudio.com/), which gives cross-platform access to audio devices.
+
+---
+
+# Calling C
+
+Julia makes it easy to call out to C and Fortran. More info [here](https://docs.julialang.org/en/stable/manual/calling-c-and-fortran-code/).
+
+```julia
+ccall((:atoi, "libc"), Int32, (Cstring, ), "42")
+```
+
+---
+
+class: center, middle
+# Questions
+### [`github.com/rkat/julia-meetup-may-2018`](http://github.com/rkat/julia-meetup-may-2018)
+### [`github.com/rkat`](http://github.com/rkat)
+### [`rkat@ieee.org`](mailto:rkat@ieee.org)
+
+    </textarea>
+    <script src="remark.js" type="text/javascript">
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/2.7.1/MathJax.js?config=TeX-AMS_HTML&delayStartupUntil=configured" type="text/javascript"></script>
+    <script type="text/javascript">
+      var slideshow = remark.create();
+      // Setup MathJax
+      MathJax.Hub.Config({
+          tex2jax: {
+          skipTags: ['script', 'noscript', 'style', 'textarea', 'pre']
+          }
+      });
+      MathJax.Hub.Configured();
+    </script>
+  </body>
+</html>
