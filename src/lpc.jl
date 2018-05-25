@@ -137,9 +137,13 @@ function dump_voicing_labels(x, fs, block_size_samples, labels, outfile)
     wavwrite(x, outfile, Fs=fs, compression=WAV.WAVE_FORMAT_PCM, chunks=out_chunks)
 end
 
-function lpc_encode_decode(xs, fs; lpcOrder=30, blockSizeMs=15, unvoicedZCR=0.12, unvoicedHz=300.)
+function lpc_encode_decode(xs, fs; excitationFile=nothing, lpcOrder=30, blockSizeMs=15, unvoicedZCR=0.12, unvoicedHz=300.)
     out = zeros(xs)
 
+    if excitationFile != nothing
+        excitationSamples, excitationFs = wavread(excitationFile)
+        assert(excitationFs == fs)
+    end
     n = ceil(Int, blockSizeMs / 1000. * fs)
     noverlap = div(n, 2)
     nblocks = div(length(xs), n)
@@ -156,10 +160,15 @@ function lpc_encode_decode(xs, fs; lpcOrder=30, blockSizeMs=15, unvoicedZCR=0.12
         p = pitch_period_samples(center_clip(block))
         freq_hz = fs / p
         ft = (z > unvoicedZCR || freq_hz > unvoicedHz) ? UnvoicedFrame : VoicedFrame
-        if ft == VoicedFrame
-            excitation = impulse_train(n; period=(p*4))
+        
+        if excitationFile == nothing
+            if ft == VoicedFrame
+                excitation = impulse_train(n; period=(p*4))
+            else
+                excitation = (rand(n) - 0.5) * 0.1
+            end
         else
-            excitation = (rand(n) - 0.5) * 0.1
+            excitation = excitationSamples[index:(index+n-1)]
         end
         push!(frameTypes, ft)
         f = PolynomialRatio([G], [1; A])
